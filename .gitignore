@@ -1,0 +1,9 @@
+.translation_cache.json
+.ai_translation_cache.json
+translate.py
+__pycache__/
+*.pyc
+weather_output.txt
+.pytest_cache/
+.ruff_cache/
+binary/

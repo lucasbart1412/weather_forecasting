@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weather-app"
+version = "0.1.0"
+description = "Machine-learning weather forecasting application"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "streamlit",
+    "plotly",
+    "matplotlib",
+    "psutil",
+    "requests",
+    "urllib3",
+    "fake-useragent",
+    "timezonefinder",
+    "geopy",
+    "joblib",
+    "optuna",
+    "optuna-integration",
+    "lightgbm",
+    "catboost",
+    "xgboost",
+    "pyarrow",
+    "deep-translator",
+    "groq",
+    "seaborn",
+]
+
+[tool.setuptools]
+py-modules = [
+    "app",
+    "config",
+    "eval_model",
+    "inference",
+    "models",
+    "plot_correlations",
+    "train",
+    "utils_features",
+]
+
+[tool.setuptools.packages.find]
+include = [
+    "infrastructure*",
+    "model_evaluation*",
+    "feature_engineering*",
+    "ml*",
+    "presentation*",
+    "training*",
+    "correlation_plotter*",
+    "data_fetcher*",
+    "tests*",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv", "__pycache__", "binary"]
+
+[tool.ruff.lint]
+select = ["E", "F", "B"]
+ignore = [
+    "E501",
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"feature_engineering/astronomy.py" = ["F401", "F811"]
+"feature_engineering/feature_pipeline.py" = ["F401", "F811", "F841", "B905"]
+"feature_engineering/physics.py" = ["F401", "F811"]
+"infrastructure/config.py" = ["E741"]
+"ml/batch_predictor.py" = ["B905"]
+"ml/preprocessing.py" = ["F401"]
+"ml/stacking.py" = ["F401", "B905"]
+"model_evaluation/evaluator_impl.py" = ["B905"]
+"training/_runtime.py" = ["F401"]
+"training/*.py" = ["F403", "F405"]
+"training/training_loop.py" = ["F405", "B905"]
