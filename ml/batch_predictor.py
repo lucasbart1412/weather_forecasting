@@ -14,6 +14,7 @@ from requests import Session
 
 from data_fetcher.data_fetcher import DataFetcher
 from feature_engineering.feature_engineering import FeatureEngineer
+from feature_engineering.target_transforms import decode_model_target
 from infrastructure.config import WeatherConfig, logger
 from ml.predictor import WeatherPredictor
 from ml.bias_correction import apply_bias_correction
@@ -103,10 +104,12 @@ class BatchWeatherPredictor(WeatherPredictor):
         res.loc[idx, "precip_prob"] = final_prob
         res.loc[idx, "raw_precip_prob"] = probs
 
-        has_signal = (probs >= 50) if block == "short" else (probs >= 70)
+        bundle = self.models["precip"][block]
+        fallback_threshold = 0.5 if block == "short" else 0.7
+        threshold = self._get_precip_threshold(bundle, fallback_threshold) * 100
+        has_signal = probs >= threshold
 
         try:
-            bundle = self.models["precip"][block]
             X_model = self._select_model_features(
                 df.iloc[idx],
                 bundle,
@@ -124,7 +127,10 @@ class BatchWeatherPredictor(WeatherPredictor):
                 ).values
             except Exception:
                 bias = 0.0
-            qty = np.maximum(0, raw_pred + bias)
+            corrected_pred = np.maximum(0, raw_pred + bias)
+            qty = decode_model_target(
+                "precip", corrected_pred, bundle.get("target_transform")
+            )
         except Exception as e:
             logger.exception(
                 f"[predict_batch] Rain quantity unavailable ({block}) : {e}"

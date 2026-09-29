@@ -2,6 +2,31 @@ import numpy as np
 import pandas as pd
 
 from feature_engineering.feature_engineering import Feature_Engineering
+from feature_engineering.target_transforms import (
+    decode_model_target,
+    decode_rain_target,
+    encode_rain_target,
+)
+
+
+def test_rain_target_log_transform_round_trips_and_bounds_negative_values():
+    amounts = np.array([0.0, 0.1, 1.0, 10.0, -1.0], dtype=np.float32)
+
+    encoded = encode_rain_target(amounts)
+    decoded = decode_rain_target(encoded)
+
+    assert np.allclose(decoded, [0.0, 0.1, 1.0, 10.0, 0.0], atol=1e-6)
+    assert np.all(np.isfinite(encoded))
+
+
+def test_model_target_decode_only_applies_to_tagged_precipitation():
+    encoded = np.log1p(np.array([0.0, 1.0, 10.0], dtype=np.float32))
+
+    decoded = decode_model_target("precip", encoded, "log1p")
+
+    assert np.allclose(decoded, [0.0, 1.0, 10.0], atol=1e-6)
+    assert np.array_equal(decode_model_target("precip", encoded, None), encoded)
+    assert np.array_equal(decode_model_target("temp", encoded, "log1p"), encoded)
 
 
 def test_add_physics_adds_features_without_changing_row_count(raw_weather_dataframe):

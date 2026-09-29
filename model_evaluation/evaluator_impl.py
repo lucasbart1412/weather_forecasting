@@ -1,17 +1,15 @@
 """
 eval_model.py
 Weather forecast model evaluation script (WeatherMaster).
-This module is self-contained and imports its dependencies from config.py,
-utils_features.py and models.py.
 """
 from pathlib import Path
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from joblib import load as job_load
 
 from feature_engineering.feature_engineering import FeatureEngineer, optimize_memory
+from feature_engineering.target_transforms import decode_model_target
 from model_evaluation.metrics import compute_forecast_metrics
 from model_evaluation.preprocessing_data import prepare_test_data
 
@@ -140,6 +138,9 @@ class ModelEvaluator:
 
         # Knowing
         raw_preds = model.predict(X_test)
+        raw_preds = decode_model_target(
+            target_variable, raw_preds, bundle.get("target_transform")
+        )
 
         # Management of specificities (scaling and anomalies)
         if target_variable == "cloud":
@@ -188,9 +189,9 @@ class ModelEvaluator:
         print(
             f"✅ 2) Gain vs Persistence  : {diff_persistance:.3f}"
             + (
-                '(The model anticipates the change!)'
+                ' (The model anticipates the change!)'
                 if diff_persistance > 0
-                else "(The model does worse than saying 'identical weather')"
+                else " (The model does worse than saying 'identical weather')"
             )
         )
 
@@ -218,9 +219,6 @@ class ModelEvaluator:
         plt.xlabel("Predicted cloud cover (%)", fontsize=12)
         plt.ylabel("Number of forecasts", fontsize=12)
         plt.xticks(np.arange(0, 101, 10))
-        plt.axvline(
-            x=50, color="red", linestyle="--", linewidth=2, label="Moyenne (50%)"
-        )
         plt.grid(axis="y", linestyle="--", alpha=0.5)
         plt.legend()
         plt.tight_layout()

@@ -100,6 +100,11 @@ def test_weather_predictor_instantiates_from_metadata(tmp_path):
     assert set(predictor.models) >= {"temp", "press"}
 
 
+def test_precip_threshold_uses_bundle_value_with_legacy_fallback():
+    assert WeatherPredictor._get_precip_threshold({"optimal_threshold": 0.35}, 0.5) == 0.35
+    assert WeatherPredictor._get_precip_threshold({}, 0.7) == 0.7
+
+
 def test_stacking_fit_is_disabled_in_production():
     with pytest.raises(NotImplementedError):
         TimeSeriesStackingRegressor().fit(np.zeros((2, 2)), np.zeros(2))

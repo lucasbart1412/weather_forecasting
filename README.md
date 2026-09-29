@@ -17,10 +17,12 @@ Weather Forecast is a local weather forecasting application based on machine lea
 - [Specifications](#specifications)
 - [Features](#features)
 - [Architecture](#architecture)
+- [Exploratory analysis](#exploratory-analysis)
 - [File structure](#file-structure)
 - [Installation](#installation)
 - [Data and models](#data-and-models)
 - [Usage](#utilisation)
+- [Exploratory analysis](#exploratory-analysis)
 - [Tests and quality](#tests-and-quality)
 - [Images](#images)
 - [Troubleshooting](#troubleshooting)
@@ -64,6 +66,7 @@ Weather Forecast combines:
 - Monthly and hourly climatology, anomalies, and cyclic encodings.
 - Hourly lags.
 - Chronological imputation without leakage from the future to the past.
+- Precipitation quantity targets use `log1p` during training and `expm1` for predictions and evaluation; rain probability and input features stay in physical units.
 - Safety bounds for humidity, pressure, temperature, rain, wind, and clouds.
 - Fallback to the current observation when a model is missing or has failed.
 - RAM cleanup via `gc` and `malloc_trim` when the platform allows it.
@@ -103,10 +106,13 @@ weather_app/
 |-- infrastructure/                # Configuration, logging, geolocation
 |-- data_fetcher/                  # Open-Meteo fetchers and data merge logic
 |-- feature_engineering/           # Temporal, astronomical and physical features
+|   |-- target_transforms.py       # Precipitation target log1p/expm1
 |-- ml/                            # Preprocessing, stacking and inference
 |-- training/                      # Training pipeline and runtime helpers
 |-- model_evaluation/              # Metrics and evaluation flows
 |-- correlation_plotter/           # Plotting and correlation analysis
+|-- eda/                           # Archive EDA report and plots
+|   |-- exploratory_analysis.py
 |-- presentation/                  # Weather icons and dashboard helpers
 |-- tests/                         # Unit and architecture tests
 |-- README.md
@@ -187,6 +193,29 @@ python3 plot_correlations.py
 
 The evaluation paths are configurable and default to the directory defined by
 `WeatherConfig.BASE_DIR`. The scripts can also be used from a notebook or a CI job.
+
+## Exploratory analysis
+
+Run the EDA against `binary/full_grid_archive.parquet`:
+
+```bash
+python3 -m eda.exploratory_analysis
+```
+
+The report and figures are written to `eda/results/`. Use `--data` to select a
+different Parquet archive and `--output` to change the output directory. The
+analysis summarizes data quality, weather-variable relationships, skewness,
+zero rates, and descriptive statistics. See
+[`eda/exploratory_analysis.py`](eda/exploratory_analysis.py).
+
+The training pipeline transforms only the precipitation quantity target with
+`log1p`; inference and evaluation apply `expm1` before returning or scoring
+amounts in their original units. Rain probability classification and predictor
+features remain unchanged. See
+[`feature_engineering/target_transforms.py`](feature_engineering/target_transforms.py).
+
+In the feature engineering code, we only apply logarithms to rainfall, which is very often skewed. 
+If you think another feature should be logarithmised, feel free to do so, but don’t forget to apply the inverse operation in the forecasts: `np.expm1()`.
 
 ## Tests and quality
 

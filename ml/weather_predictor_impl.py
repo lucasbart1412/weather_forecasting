@@ -6,6 +6,7 @@ from numpy import array, cos, greater, less, pi, sin
 from pandas import DataFrame, Series, Timedelta, to_datetime
 
 from feature_engineering.feature_engineering import FeatureEngineer
+from feature_engineering.target_transforms import decode_model_target
 from infrastructure.config import WeatherConfig
 from ml.bias_correction import apply_bias_correction
 
@@ -32,6 +33,10 @@ class WeatherPredictor:
             return "medium"
         else:
             return "long"
+
+    @staticmethod
+    def _get_precip_threshold(bundle, fallback):
+        return float(bundle.get("optimal_threshold", fallback))
 
     def get_tide_extremes(self, predictions):
         """Detects peaks (Highs) and troughs (Lows) in the prediction series."""
@@ -100,9 +105,10 @@ class WeatherPredictor:
                     # predict_proba returns [P(no), P(yes)]
                     res["precip_prob"] = prob_model.predict_proba(X_model)[0][1] * 100
 
-                # 2. Predict quantity only if proba > 5% (to avoid noise)
+                threshold = self._get_precip_threshold(bundle, 0.05) * 100
+                # 2. Predict quantity only above the validation-optimized threshold.
                 bundle = self.models[t][block]
-                if res.get("precip_prob", 0) > 5:
+                if res.get("precip_prob", 0) >= threshold:
                     # Inference with the right columns
                     raw_prob = res["precip_prob"]
                     res["raw_precip_prob"] = raw_prob
@@ -134,6 +140,11 @@ class WeatherPredictor:
             except Exception:
                 bias = 0.0
             prediction_finale = raw_pred + bias
+            prediction_finale = decode_model_target(
+                t,
+                [prediction_finale],
+                bundle.get("target_transform"),
+            )[0]
 
             if t in ["temp", "press", "hum"]:
                 norm = self.meta["clima"].get(t, {}).get((m_h, t_h), obs.get(t, 0))

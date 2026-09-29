@@ -54,6 +54,7 @@ include = [
     "training*",
     "correlation_plotter*",
     "data_fetcher*",
+    "eda*",
     "tests*",
 ]
 

@@ -30,6 +30,7 @@ graph TB
     subgraph Domain["Weather preparation"]
         Features["feature_engineering/feature_engineer_impl.py\nfeature engineering"]
         Physics["feature_engineering/physics.py\nphysical features"]
+        TargetTransform["feature_engineering/target_transforms.py\nrain target log1p / expm1"]
     end
 
     subgraph ML["Machine Learning"]
@@ -42,6 +43,7 @@ graph TB
         Runtime["training/_runtime.py\nshared imports"]
         Memory["training/memory_impl.py\nmemory cleanup"]
         Eval["model_evaluation/evaluator_impl.py\nevaluation"]
+        EDA["eda/exploratory_analysis.py\narchive report and plots"]
     end
 
     App --> Fetch
@@ -50,6 +52,10 @@ graph TB
     Fetch --> Features
     Features --> Physics
     Features --> Inference
+    Train --> TargetTransform
+    TargetTransform --> Inference
+    TargetTransform --> Eval
+    EDA --> Fetch
     Prep --> Inference
     Inference --> App
     Train --> Inference
@@ -65,6 +71,13 @@ graph TB
 
 The modules in `feature_engineering/` receive data and parameters and
 return DataFrames or calculated values. Astronomical, physical, climatological, and lag calculations remain separate from the interface.
+
+[`feature_engineering/target_transforms.py`](feature_engineering/target_transforms.py)
+contains the precipitation-target transform used by training, inference, and
+evaluation. Only the precipitation quantity target is encoded with `log1p`;
+predictor columns and the rain-probability classifier remain in their original
+physical representation. Predictions are decoded with `expm1` before physical
+bounds and metrics are applied.
 
 ### Infrastructure and data
 
@@ -115,10 +128,26 @@ The bundles contain the model, the expected features, the bias correctors and, w
 2. `infrastructure.geo_api` reads the cache or uses the geocoding service.  
 3. `DataFetcher` retrieves hourly weather and marine data.  
 4. `FeatureEngineer` reindexes the series and adds climatology, cycles, physics and lags.  
-5. The predictor loads the expected metadata and bundles.  
-6. `BatchWeatherPredictor` builds a matrix for all horizons.  
-7. The outputs are bounded and use the current observation as a fallback.
-8. The presentation renders the results without recalculating the business logic.
+5. Training shifts future precipitation targets and encodes their quantities with `log1p`; other targets and all predictor features are unchanged.  
+6. The predictor loads the expected metadata and bundles.  
+7. `BatchWeatherPredictor` builds a matrix for all horizons and decodes tagged precipitation models with `expm1`.  
+8. The outputs are bounded in physical units and use the current observation as a fallback.
+9. Evaluation also decodes tagged precipitation predictions before computing metrics.
+10. The presentation renders the results without recalculating the business logic.
+
+## Exploratory analysis
+
+[`eda/exploratory_analysis.py`](eda/exploratory_analysis.py) reads the weather
+archive and generates a Markdown report plus correlation, relationship, and
+distribution plots under `eda/results/` by default. Run it from the project root
+with `python3 -m eda.exploratory_analysis`; `--data` and `--output` override the
+input archive and output directory. The report includes data quality, Spearman
+relationships, skewness, zero rates, and a descriptive-statistics table.
+
+New precipitation model bundles are tagged with `target_transform: log1p` so
+inference and evaluation can restore rainfall amounts. Untagged legacy bundles
+continue to be interpreted in their original physical scale; training replaces
+legacy precipitation bundles when those targets are retrained.
 
 ## 6. Preserved business contracts
 

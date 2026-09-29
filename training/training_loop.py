@@ -1,4 +1,5 @@
 from infrastructure.config import WeatherConfig
+from feature_engineering.target_transforms import decode_rain_target, encode_rain_target
 from training._runtime import *
 from training.memory_impl import MemoryManager
 from numpy.random import RandomState
@@ -22,7 +23,10 @@ class TrainingLoopMixin:
             y_col = f"{t}_anom" if t in ["temp", "press", "hum"] else t
             for _block_name, horizons in self.BLOCKS.items():
                 for h in horizons:
-                    df[f"target_{t}_h{h}"] = df[y_col].shift(-h)
+                    target_values = df[y_col].shift(-h)
+                    if t == "precip":
+                        target_values = encode_rain_target(target_values)
+                    df[f"target_{t}_h{h}"] = target_values
 
         gap_hours = 168
 
@@ -108,10 +112,24 @@ class TrainingLoopMixin:
             for t in WeatherConfig.TARGETS:
                 start_time_model = time()
 
-                # Skip models already trained (optimization)
-                if os.path.exists(self.path / f"model_{t}_{block_name}.pkl"):
-                    logger.info('Model already trained!')
-                    continue
+                # Retrain legacy precipitation bundles once to adopt log1p targets.
+                model_path = self.path / f"model_{t}_{block_name}.pkl"
+                if model_path.exists():
+                    if t != "precip":
+                        logger.info("Model already trained!")
+                        continue
+                    try:
+                        existing_bundle = job_load(model_path)
+                    except Exception as exc:
+                        logger.warning(f"Unable to inspect existing model {model_path}: {exc}")
+                        existing_bundle = {}
+                    if (
+                        isinstance(existing_bundle, dict)
+                        and existing_bundle.get("target_transform") == "log1p"
+                    ):
+                        logger.info("Precipitation model already uses log1p targets!")
+                        continue
+                    logger.info("Retraining precipitation model with log1p targets.")
 
                 X_tr_list, y_tr_list = [], []
                 val_dates_list = []
@@ -300,8 +318,9 @@ class TrainingLoopMixin:
 
                 # Probability model for precip
                 if t == "precip":
-                    y_tr_bin = (y_tr > 0.1).astype(int)
-                    y_val_bin = (y_val > 0.1).astype(int)
+                    optimal_threshold = 0.5
+                    y_tr_bin = (decode_rain_target(y_tr) > 0.1).astype(int)
+                    y_val_bin = (decode_rain_target(y_val) > 0.1).astype(int)
 
                     prob_params = {
                         "n_estimators": 10000,
@@ -771,7 +790,10 @@ class TrainingLoopMixin:
                     "m_high": m_high,
                     "bias_corrector": bias_corrector,
                     "features": used_features,
+                    "target_transform": "log1p" if t == "precip" else None,
                 }
+                if t == "precip":
+                    bundle["optimal_threshold"] = optimal_threshold
                 job_dump(bundle, self.path / f"model_{t}_{block_name}.pkl", compress=6)
                 job_dump(meta_data, self.path / "global_meta.pkl")
 
@@ -789,6 +811,14 @@ class TrainingLoopMixin:
                     preds_cal_corrected,
                 )
                 preds_tr_base = model.predict(X_tr)
+                if t == "precip":
+                    y_tr_metric = decode_rain_target(y_tr_metric)
+                    y_val_metric = decode_rain_target(y_val_metric)
+                    y_cal_metric = decode_rain_target(y_cal_metric)
+                    preds_val_metric = decode_rain_target(preds_val_metric)
+                    preds_val_corr_metric = decode_rain_target(preds_val_corr_metric)
+                    preds_cal_corr_metric = decode_rain_target(preds_cal_corr_metric)
+                    preds_tr_base = decode_rain_target(preds_tr_base)
 
                 if t in ["wind", "gusts", "hum"]:
                     main_metric_str = f"Val RMSE: {root_mean_squared_error(y_val_metric, preds_val_metric):.3f} | Corr: {root_mean_squared_error(y_val_metric, preds_val_corr_metric):.3f}"
@@ -800,12 +830,16 @@ class TrainingLoopMixin:
                     q10_preds = m_low.predict(X_val)
                     if t == "cloud":
                         q10_preds = q10_preds * 100.0
+                    elif t == "precip":
+                        q10_preds = decode_rain_target(q10_preds)
                     q10_str = f"Pinball: {mean_pinball_loss(y_val_metric, q10_preds, alpha=0.1):.3f}"
 
                 if m_high is not None:
                     q90_preds = m_high.predict(X_val)
                     if t == "cloud":
                         q90_preds = q90_preds * 100.0
+                    elif t == "precip":
+                        q90_preds = decode_rain_target(q90_preds)
                     q90_str = f"Pinball: {mean_pinball_loss(y_val_metric, q90_preds, alpha=0.9):.3f}"
 
                 mae_val_base = mean_absolute_error(y_val_metric, preds_val_metric)
