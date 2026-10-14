@@ -7,14 +7,15 @@ import streamlit as st
 
 from feature_engineering.feature_engineering import FeatureEngineer
 
-# Imports from the new inference layer
-from inference import BatchWeatherPredictor, FixedDataFetcher
+from ml.batch_predictor import BatchWeatherPredictor, FixedDataFetcher
 
 # PART 1 — LOADING & CACHE
 from infrastructure.config import WeatherConfig, logger
 from infrastructure.geo_api import LocationManager
 from presentation.dashboard_helpers import (
     build_daily_aggregate,
+    chart_variable_options,
+    filter_short_term_precipitation,
     get_sun_times_cached,
     plot_hourly,
     safe_float,
@@ -215,16 +216,6 @@ div[data-testid="stButton"] > button {
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 WEEKDAY_LABELS = {0: "Mon.", 1: "Tue.", 2: "Wed.", 3: "Thu.", 4: "Fri.", 5: "Sat.", 6: "Sun."}
-
-VARIABLE_OPTIONS = {
-    "🌡️ Temperature": "temp",
-    "🌧️ Rain & Probability": "precip",
-    "💨 Wind": "wind",
-    "☁️ Cloud Cover": "cloud",
-    "💦 Humidity": "hum",
-    "🌊 Tides": "tide",
-}
-
 
 def choice_control(label: str, options: list, key: str):
     """Uses st.segmented_control if available (Streamlit >= 1.36), otherwise horizontal radio fallback."""
@@ -429,14 +420,22 @@ st.markdown(
 )
 
 choice_today_label = choice_control(
-    "Variable (24h)", list(VARIABLE_OPTIONS.keys()), key="today_var"
+    "Variable (24h)",
+    list(chart_variable_options(include_precipitation=True)),
+    key="today_var",
 )
-var_today = VARIABLE_OPTIONS.get(choice_today_label, "temp")
+var_today = chart_variable_options(include_precipitation=True).get(
+    choice_today_label, "temp"
+)
 df_24h = df_pred[df_pred["horizon_h"] <= 24].reset_index(drop=True)
+if var_today == "precip":
+    df_24h = filter_short_term_precipitation(df_24h)
 
 fig_24h = plot_hourly(df_24h, var_today)
 if fig_24h is not None:
     st.plotly_chart(fig_24h, width="stretch", key="fig_24h")
+    if var_today == "precip":
+        st.caption("Precipitation is shown for short horizons only (up to 18 hours).")
 else:
     st.info(
         'ℹ️ This data is not currently available (target not trained or missing for this location).'
@@ -455,10 +454,12 @@ if selected_date is not None:
 
     choice_day_label = choice_control(
         "Variable (selected day)",
-        list(VARIABLE_OPTIONS.keys()),
+        list(chart_variable_options(include_precipitation=False)),
         key="day_detail_var",
     )
-    var_day = VARIABLE_OPTIONS.get(choice_day_label, "temp")
+    var_day = chart_variable_options(include_precipitation=False).get(
+        choice_day_label, "temp"
+    )
     df_day = df_pred[
         pd.to_datetime(df_pred["time"]).dt.date == selected_date
     ].reset_index(drop=True)
@@ -480,9 +481,13 @@ st.markdown(
 )
 
 choice_hourly_label = choice_control(
-    "Variable (7-day timetable)", list(VARIABLE_OPTIONS.keys()), key="hourly_var"
+    "Variable (7-day timetable)",
+    list(chart_variable_options(include_precipitation=False)),
+    key="hourly_var",
 )
-var_hourly = VARIABLE_OPTIONS.get(choice_hourly_label, "temp")
+var_hourly = chart_variable_options(include_precipitation=False).get(
+    choice_hourly_label, "temp"
+)
 
 fig_hourly = plot_hourly(df_pred, var_hourly)
 if fig_hourly is not None:

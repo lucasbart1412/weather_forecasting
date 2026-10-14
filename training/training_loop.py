@@ -1,8 +1,44 @@
 from infrastructure.config import WeatherConfig
 from feature_engineering.target_transforms import decode_rain_target, encode_rain_target
+from ml.bias_correction import apply_bias_correction
+from training.bias_corrector import fit_bias_corrector
+from training.calibration import split_calibration_data
+from training.metrics import (
+    has_multiple_classes,
+    regression_metrics,
+    select_f1_threshold,
+)
+from training.progress import TrainingEtaEstimator
 from training._runtime import *
 from training.memory_impl import MemoryManager
 from numpy.random import RandomState
+from time import perf_counter
+
+
+def _constrain_prediction(target: str, values):
+    """Apply the same physical bounds used for forecast output."""
+    bounded = (
+        maximum(0, values)
+        if target in ["precip", "wind", "gusts", "hum", "cloud"]
+        else values
+    )
+    if target in ["hum", "cloud"]:
+        bounded = minimum(100, bounded)
+    return bounded
+
+
+def _metric_values(target: str, values):
+    """Convert encoded precipitation values to physical units for evaluation."""
+    if target == "precip":
+        return decode_rain_target(values)
+    return values
+
+
+def _primary_error(target: str, actual, predicted) -> float:
+    metrics = regression_metrics(actual, predicted)
+    if target in ["wind", "gusts", "hum"]:
+        return metrics["rmse"]
+    return metrics["mae"]
 
 
 class TrainingLoopMixin:
@@ -78,69 +114,69 @@ class TrainingLoopMixin:
         del climatology_ref
         MemoryManager.trim_memory()
 
-        # Meters
-        steps_stacking = 15700
-        steps_long_block = 2000
-        steps_short_block = 10000
-        steps_quantile = 6000
-        total_steps = (
-            2000
-            + 100 * 1000
-            + steps_stacking * len(WeatherConfig.TARGETS)
-            + steps_long_block * len(WeatherConfig.TARGETS)
-            + steps_short_block * len(WeatherConfig.TARGETS)
-            + steps_quantile * 2
-        )
-        step = 0
-
         df = df.sort_values("date").reset_index(drop=True)
-        start_time = time()
-        logger.info(f"\n🚀 Training by Blocks ({total_steps} iterations planned)")
 
         missing = [f for f in base_features if f not in df.columns]
         del df
         MemoryManager.trim_memory()
 
         if missing:
-            logger.error(f"❌ Missing columns: {missing}")
+            raise ValueError(f"Training data is missing required features: {missing}")
 
-        if not hasattr(self, "bias_correctors"):
-            self.bias_correctors = {}
+        # Build a work plan that excludes reusable artifacts from the ETA.
+        pending_tasks = []
+        for planned_block in self.BLOCKS:
+            for planned_target in WeatherConfig.TARGETS:
+                model_path = self.path / f"model_{planned_target}_{planned_block}.pkl"
+                should_train = not model_path.exists()
+                if model_path.exists():
+                    if planned_target != "precip":
+                        should_train = False
+                    else:
+                        try:
+                            bundle = job_load(model_path)
+                        except Exception as exc:
+                            logger.warning(
+                                f"Unable to inspect existing model {model_path}: {exc}"
+                            )
+                            should_train = True
+                        else:
+                            should_train = not (
+                                isinstance(bundle, dict)
+                                and bundle.get("target_transform") == "log1p"
+                                and bundle.get("precip_strategy_version") == 3
+                                and (
+                                    self.path
+                                    / f"model_precip_prob_{planned_block}.pkl"
+                                ).exists()
+                            )
+                if should_train:
+                    pending_tasks.append((planned_block, planned_target))
+
+        eta_estimator = TrainingEtaEstimator(pending_tasks)
+        start_time = perf_counter()
+        logger.info(
+            f"\n🚀 Training by Blocks ({len(pending_tasks)} model tasks planned)"
+        )
 
         # Main Loop
         for block_name, horizons in self.BLOCKS.items():
             for t in WeatherConfig.TARGETS:
-                start_time_model = time()
+                start_time_model = perf_counter()
 
-                # Retrain legacy precipitation bundles once to adopt log1p targets.
-                model_path = self.path / f"model_{t}_{block_name}.pkl"
-                if model_path.exists():
-                    if t != "precip":
-                        logger.info("Model already trained!")
-                        continue
-                    try:
-                        existing_bundle = job_load(model_path)
-                    except Exception as exc:
-                        logger.warning(f"Unable to inspect existing model {model_path}: {exc}")
-                        existing_bundle = {}
-                    if (
-                        isinstance(existing_bundle, dict)
-                        and existing_bundle.get("target_transform") == "log1p"
-                    ):
-                        logger.info("Precipitation model already uses log1p targets!")
-                        continue
-                    logger.info("Retraining precipitation model with log1p targets.")
-
-                X_tr_list, y_tr_list = [], []
-                val_dates_list = []
-                cal_dates_list = []
-                X_val_list, y_val_list = [], []
-                X_cal_list, y_cal_list = [], []
-                val_results_list = []
+                # Reuse only artifacts built with the current precipitation pipeline.
+                if (block_name, t) not in pending_tasks:
+                    logger.info("Model already trained with the current pipeline.")
+                    continue
 
                 logger.info(
-                    f"⏳ Block '{block_name}' | Target '{t}' ({step + 1}/{total_steps})"
+                    f"⏳ Block '{block_name}' | Target '{t}' "
+                    f"({eta_estimator.completed_count + 1}/{len(pending_tasks)})"
                 )
+
+                X_tr_list, y_tr_list = [], []
+                X_val_list, y_val_list = [], []
+                X_cal_list, y_cal_list = [], []
 
                 # Loading Master Data
                 base_data = job_load(self.path / "base_data.pkl")
@@ -203,19 +239,6 @@ class TrainingLoopMixin:
                             2 * pi * future_dates.dt.month / 12
                         ).astype("float32")
 
-                        if d_set is df_val_base:
-                            val_results_list.append(
-                                DataFrame(
-                                    {
-                                        "hour": future_dates.dt.hour,
-                                        "y_true": y_h_clean.values,
-                                    }
-                                )
-                            )
-                            val_dates_list.append(future_dates)
-                        elif d_set is df_calib:
-                            cal_dates_list.append(future_dates)
-
                         l_x.append(X_h)
                         l_y.append(y_h_clean)
 
@@ -241,8 +264,9 @@ class TrainingLoopMixin:
                 MemoryManager.trim_memory()
 
                 if not X_tr_list or not X_val_list:
-                    logger.error(f"❌ No valid data for {t} | {block_name}")
-                    continue
+                    raise ValueError(
+                        f"No train or validation data available for {t}/{block_name}."
+                    )
 
                 # Chronological weights
                 weights_list = []
@@ -250,6 +274,9 @@ class TrainingLoopMixin:
                     w_chrono = exp(linspace(0, 1.2, len(df_x)))
                     w_horizon = 1.0
                     weights_list.append(w_chrono * w_horizon)
+
+                # Keep the training-set boundaries needed by the stacking trainer.
+                X_tr_lengths = [len(data) for data in X_tr_list]
 
                 # Float32 concatenation
                 X_tr = concat(X_tr_list, ignore_index=True).astype("float32")
@@ -261,21 +288,6 @@ class TrainingLoopMixin:
 
                 del X_tr_list, y_tr_list, X_val_list, y_val_list, X_cal_list, y_cal_list
                 MemoryManager.trim_memory()
-
-                # Lengths per horizon
-                X_tr_lengths = []
-                X_val_lengths = []
-                X_cal_lengths = []
-
-                for _h in horizons_valides:
-                    mask_tr = y_tr.notna()
-                    X_tr_lengths.append(mask_tr.sum())
-
-                    mask_val = y_val.notna()
-                    X_val_lengths.append(mask_val.sum())
-
-                    mask_cal = y_cal.notna()
-                    X_cal_lengths.append(mask_cal.sum())
 
                 # Selection features by variance
                 selector = (
@@ -293,11 +305,43 @@ class TrainingLoopMixin:
                 X_val = X_val[used_features]
                 X_cal = X_cal[used_features]
 
-                # Calibration backup
+                (
+                    X_cal,
+                    y_cal,
+                    X_cal_threshold,
+                    y_cal_threshold,
+                    X_cal_eval,
+                    y_cal_eval,
+                ) = split_calibration_data(
+                    X_cal, y_cal, gap_steps=max(horizons)
+                )
+
+                # Keep bias-corrector fitting and calibration evaluation disjoint.
                 X_cal.to_parquet(self.path / f"X_cal_{t}_{block_name}.parquet")
                 job_dump(y_cal, self.path / f"y_cal_{t}_{block_name}.pkl")
+                X_cal_eval.to_parquet(
+                    self.path / f"X_cal_eval_{t}_{block_name}.parquet"
+                )
+                job_dump(
+                    y_cal_eval,
+                    self.path / f"y_cal_eval_{t}_{block_name}.pkl",
+                )
+                X_cal_threshold.to_parquet(
+                    self.path / f"X_cal_threshold_{t}_{block_name}.parquet"
+                )
+                job_dump(
+                    y_cal_threshold,
+                    self.path / f"y_cal_threshold_{t}_{block_name}.pkl",
+                )
 
-                del X_cal, y_cal
+                del (
+                    X_cal,
+                    y_cal,
+                    X_cal_threshold,
+                    y_cal_threshold,
+                    X_cal_eval,
+                    y_cal_eval,
+                )
                 MemoryManager.trim_memory()
 
                 weights = concat([Series(w) for w in weights_list]).values
@@ -317,10 +361,19 @@ class TrainingLoopMixin:
                     X_val = X_val.drop(columns=["time_step"])
 
                 # Probability model for precip
+                conditional_precipitation = (
+                    block_name == "medium" and t == "precip"
+                )
+                precip_val_probs = None
+                optimal_threshold = 0.5
                 if t == "precip":
-                    optimal_threshold = 0.5
                     y_tr_bin = (decode_rain_target(y_tr) > 0.1).astype(int)
                     y_val_bin = (decode_rain_target(y_val) > 0.1).astype(int)
+                    if not has_multiple_classes(y_tr_bin):
+                        raise ValueError(
+                            f"Rain classifier for {block_name} requires both "
+                            "wet and dry training samples."
+                        )
 
                     prob_params = {
                         "n_estimators": 10000,
@@ -354,75 +407,89 @@ class TrainingLoopMixin:
                         else X_val
                     )
 
-                    total_steps -= 2000
-
                     # ✅ LIGHTGBM CORRECTION: eval_X/eval_y
                     prob_model.fit(
                         X_tr_prob,
                         y_tr_bin,
                         eval_set=[(X_val_prob, y_val_bin)],
-                        eval_metric="auc",
+                        eval_metric=(
+                            "auc"
+                            if has_multiple_classes(y_val_bin)
+                            else "binary_logloss"
+                        ),
                         callbacks=[early_stopping(100), log_evaluation(0)],
                     )
 
-                    best_it_prob = (
-                        prob_model.best_iteration_
-                        if (
-                            prob_model.best_iteration_
-                            and prob_model.best_iteration_ > 0
-                        )
-                        else prob_model.n_estimators
+                    precip_val_probs = prob_model.predict_proba(X_val_prob)[:, 1]
+                    X_cal_prob = read_parquet(
+                        self.path / f"X_cal_threshold_{t}_{block_name}.parquet"
                     )
-                    total_steps = total_steps + best_it_prob
-                    step += best_it_prob
-
-                    try:
-                        prob_preds = prob_model.predict_proba(X_val_prob)[:, 1]
-
-                        seuils = arange(0.1, 0.9, 0.05)
-                        best_seuil = 0.5
-                        best_f1 = 0
-
-                        for seuil in seuils:
-                            preds_temp = (prob_preds >= seuil).astype(int)
-                            score_f1 = f1_score(y_val_bin, preds_temp, pos_label=1)
-
-                            if score_f1 > best_f1:
-                                best_f1 = score_f1
-                                best_seuil = seuil
-
-                        logger.info(
-                            f"💡 Optimal threshold: {best_seuil:.2f} (F1: {best_f1:.4f})"
+                    if "time_step" in X_cal_prob.columns:
+                        X_cal_prob = X_cal_prob.drop(columns=["time_step"])
+                    y_cal_bin = (
+                        decode_rain_target(
+                            job_load(
+                                self.path
+                                / f"y_cal_threshold_{t}_{block_name}.pkl"
+                            )
                         )
+                        > 0.1
+                    ).astype(int)
+                    cal_probs = prob_model.predict_proba(X_cal_prob)[:, 1]
+                    optimal_threshold, calibration_f1 = select_f1_threshold(
+                        y_cal_bin,
+                        cal_probs,
+                        arange(0.1, 0.9, 0.05),
+                    )
 
-                        binary_preds = (prob_preds >= best_seuil).astype(int)
-                        error_rate = (1 - accuracy_score(y_val_bin, binary_preds)) * 100
-                        logger.info(f"Classification error: {error_rate:.2f}%")
+                    logger.info(
+                        f"💡 Optimal threshold: {optimal_threshold:.2f} "
+                        f"(threshold-tuning F1: {calibration_f1:.4f})"
+                    )
 
-                        brier = brier_score_loss(y_val_bin, prob_preds)
-                        logger.info(f"Brier Score: {brier:.4f}")
+                    binary_preds = (precip_val_probs >= optimal_threshold).astype(int)
+                    validation_f1 = f1_score(
+                        y_val_bin,
+                        binary_preds,
+                        pos_label=1,
+                        zero_division=0,
+                    )
+                    logger.info(f"Validation F1: {validation_f1:.4f}")
+                    error_rate = (1 - accuracy_score(y_val_bin, binary_preds)) * 100
+                    logger.info(f"Classification error: {error_rate:.2f}%")
 
-                        report = classification_report(
-                            y_val_bin,
-                            binary_preds,
-                            target_names=["No rain", "Rain"],
-                        )
-                        logger.info(f"\n  📊 Report Classification:\n{report}")
+                    brier = brier_score_loss(y_val_bin, precip_val_probs)
+                    logger.info(f"Brier Score: {brier:.4f}")
 
-                    except Exception as e:
-                        logger.error(f"Evaluation error: {e}")
+                    report = classification_report(
+                        y_val_bin,
+                        binary_preds,
+                        labels=[0, 1],
+                        target_names=["No rain", "Rain"],
+                        zero_division=0,
+                    )
+                    logger.info(f"\n  📊 Report Classification:\n{report}")
 
                     job_dump(
                         prob_model, self.path / f"model_precip_prob_{block_name}.pkl"
                     )
-                    del prob_model, X_tr_prob, X_val_prob, y_tr_bin, y_val_bin
+                    del (
+                        prob_model,
+                        X_tr_prob,
+                        X_val_prob,
+                        X_cal_prob,
+                        y_tr_bin,
+                        y_val_bin,
+                        y_cal_bin,
+                        cal_probs,
+                    )
                     MemoryManager.trim_memory()
 
                 # Optuna for short block
                 if block_name == "short" and t in ["temp", "precip", "cloud"]:
                     sample_size = min(len(X_tr), 130000)
                     indices = sort(
-                        RandomState().choice(
+                        RandomState(42).choice(
                             len(X_tr), sample_size, replace=False
                         )
                     )
@@ -445,7 +512,7 @@ class TrainingLoopMixin:
                     logger.info(
                         f"🔍 Optuna for {t} (Short) on {sample_size} points..."
                     )
-                    best_params, total_iterations = self.optimize_short_block(
+                    best_params, _ = self.optimize_short_block(
                         X_opt_tr, y_opt_tr, X_opt_val, y_opt_val, t, weight=w_opt_tr
                     )
 
@@ -453,12 +520,6 @@ class TrainingLoopMixin:
                     MemoryManager.trim_memory()
 
                     model = LGBMRegressor(**best_params)
-                    total_steps = (
-                        total_steps
-                        - (40000 if t == "temp" else 30000)
-                        + total_iterations
-                    )
-                    step += total_iterations
                 else:
                     model = self.get_advanced_models(
                         block_name, t, lengths=X_tr_lengths, X_tr=X_tr
@@ -478,22 +539,33 @@ class TrainingLoopMixin:
                             log_evaluation(2000),
                         ],
                     )
-                    best_it = (
-                        model.best_iteration_
-                        if (model.best_iteration_ and model.best_iteration_ > 0)
-                        else model.n_estimators
-                    )
-
-                    if block_name == "short":
-                        total_steps = total_steps - steps_short_block + best_it
-                    if block_name == "long":
-                        total_steps = total_steps - steps_long_block + best_it
-                    step += best_it
                 else:
                     # Stacking
                     logger.info(f"🔍 Stacking for {t} | {block_name}...")
+
+                    if conditional_precipitation:
+                        train_wet_mask = decode_rain_target(y_tr) > 0.1
+                        val_wet_mask = decode_rain_target(y_val) > 0.1
+                        if not train_wet_mask.any() or not val_wet_mask.any():
+                            raise ValueError(
+                                "Medium-horizon precipitation intensity training "
+                                "requires wet samples in both train and validation."
+                            )
+
+                        job_dump(
+                            {"X": X_val, "y": y_val},
+                            self.path / f"eval_val_{t}_{block_name}.pkl",
+                        )
+                        X_fit = X_tr.loc[train_wet_mask]
+                        y_fit = y_tr.loc[train_wet_mask]
+                        X_val_fit = X_val.loc[val_wet_mask]
+                        y_val_fit = y_val.loc[val_wet_mask]
+                    else:
+                        X_fit, y_fit = X_tr, y_tr
+                        X_val_fit, y_val_fit = X_val, y_val
+
                     job_dump(
-                        {"X": X_val, "y": y_val},
+                        {"X": X_val_fit, "y": y_val_fit},
                         self.path / f"val_{t}_{block_name}.pkl",
                     )
                     MemoryManager.trim_memory()
@@ -501,11 +573,11 @@ class TrainingLoopMixin:
                     del X_val, y_val
                     MemoryManager.trim_memory()
 
-                    fit_data = {"X": X_tr, "y": y_tr}
+                    fit_data = {"X": X_fit, "y": y_fit}
                     job_dump(
                         fit_data, filename=self.path / f"fit_data_{t}_{block_name}.pkl"
                     )
-                    del X_tr, y_tr, fit_data
+                    del X_tr, y_tr, X_fit, y_fit, X_val_fit, y_val_fit, fit_data
                     MemoryManager.trim_memory()
 
                     model.fit(
@@ -514,16 +586,31 @@ class TrainingLoopMixin:
                         path=self.path,
                         val_path=self.path / f"val_{t}_{block_name}.pkl",
                     )
-                    step += steps_stacking
 
                     X_tr = job_load(self.path / f"fit_data_{t}_{block_name}.pkl")["X"]
                     y_tr = job_load(self.path / f"fit_data_{t}_{block_name}.pkl")["y"]
-                    X_val = job_load(self.path / f"val_{t}_{block_name}.pkl")["X"]
-                    y_val = job_load(self.path / f"val_{t}_{block_name}.pkl")["y"]
+                    if conditional_precipitation:
+                        eval_data = job_load(
+                            self.path / f"eval_val_{t}_{block_name}.pkl"
+                        )
+                        X_val, y_val = eval_data["X"], eval_data["y"]
+                        del eval_data
+                    else:
+                        X_val = job_load(
+                            self.path / f"val_{t}_{block_name}.pkl"
+                        )["X"]
+                        y_val = job_load(
+                            self.path / f"val_{t}_{block_name}.pkl"
+                        )["y"]
 
                     for name in [
                         f"val_{t}_{block_name}.pkl",
                         f"fit_data_{t}_{block_name}.pkl",
+                        *(
+                            [f"eval_val_{t}_{block_name}.pkl"]
+                            if conditional_precipitation
+                            else []
+                        ),
                     ]:
                         path = self.path / name
                         if path.exists():
@@ -546,137 +633,138 @@ class TrainingLoopMixin:
 
                 if importances is not None:
                     feat_imp = Series(importances, index=model.feature_names_in_)
+                    total_importance = feat_imp.sum()
+                    if total_importance > 0:
+                        feat_imp = feat_imp / total_importance
                     top_5 = feat_imp.sort_values(ascending=False).head(5)
 
                     logger.info(f"🔍 Top 5 for {t} ({block_name}):")
                     for rank, (name, val) in enumerate(top_5.items(), 1):
-                        logger.info(f"{rank}. {name} ({val:.0f})")
+                        logger.info(f"{rank}. {name} ({val:.2%})")
 
                 # Calibration loading
                 X_cal = read_parquet(self.path / f"X_cal_{t}_{block_name}.parquet")
                 y_cal = job_load(self.path / f"y_cal_{t}_{block_name}.pkl")
+                X_cal_eval = read_parquet(
+                    self.path / f"X_cal_eval_{t}_{block_name}.parquet"
+                )
+                y_cal_eval = job_load(
+                    self.path / f"y_cal_eval_{t}_{block_name}.pkl"
+                )
 
                 if "time_step" in X_cal.columns:
                     X_cal = X_cal.drop(columns=["time_step"])
+                if "time_step" in X_cal_eval.columns:
+                    X_cal_eval = X_cal_eval.drop(columns=["time_step"])
 
                 preds_val = model.predict(X_val)
-                preds_cal = model.predict(X_cal)
+                preds_cal_fit = model.predict(X_cal)
+                preds_cal = model.predict(X_cal_eval)
+                preds_val_unthresholded = preds_val.copy()
 
-                # Dates Alignment
-                val_dates_series = to_datetime(
-                    concat([Series(d) for d in val_dates_list], ignore_index=True)
-                )
-                cal_dates_series = to_datetime(
-                    concat([Series(d) for d in cal_dates_list], ignore_index=True)
-                )
-
-                if t not in self.bias_correctors:
-                    self.bias_correctors[t] = {}
-
-                start_idx = 0
-                start_idx_cal = 0
-
-                bias_corrections_val_list = []
-                bias_corrections_cal_list = []
-
-                def get_season_name(month):
-                    if month in [12, 1, 2]:
-                        return "winter"
-                    if month in [3, 4, 5]:
-                        return "spring"
-                    if month in [6, 7, 8]:
-                        return "summer"
-                    return "autumn"
-
-                for h, length, cal_length in zip(
-                    horizons_valides, X_val_lengths, X_cal_lengths
-                ):
-                    h_int = int(h)
-                    end_idx = start_idx + length
-                    end_idx_cal = start_idx_cal + cal_length
-
-                    y_true_h_cal = y_cal.iloc[start_idx_cal:end_idx_cal].values
-                    preds_h_cal = preds_cal[start_idx_cal:end_idx_cal]
-                    dates_h_cal = cal_dates_series.iloc[
-                        start_idx_cal:end_idx_cal
-                    ].reset_index(drop=True)
-                    dates_h_val = val_dates_series.iloc[start_idx:end_idx].reset_index(
-                        drop=True
+                # Fit bias correction on calibration-fit rows only.
+                if conditional_precipitation:
+                    cal_wet_mask = decode_rain_target(y_cal) > 0.1
+                    if not cal_wet_mask.any():
+                        raise ValueError(
+                            "Medium-horizon precipitation bias correction requires "
+                            "wet calibration-fit samples."
+                        )
+                    bias_corrector = fit_bias_corrector(
+                        X_cal.loc[cal_wet_mask],
+                        y_cal.loc[cal_wet_mask],
+                        preds_cal_fit[cal_wet_mask],
                     )
-
-                    errors_cal = y_true_h_cal - preds_h_cal
-
-                    cal_hours = dates_h_cal.dt.hour
-                    cal_seasons = dates_h_cal.dt.month.apply(get_season_name)
-
-                    df_err_cal = DataFrame(
-                        {"season": cal_seasons, "hour": cal_hours, "err": errors_cal},
-                        copy=False,
+                else:
+                    bias_corrector = fit_bias_corrector(
+                        X_cal, y_cal, preds_cal_fit
                     )
-
-                    global_hourly_bias = (
-                        df_err_cal.groupby("hour")["err"].mean().to_dict()
-                    )
-                    seasonal_bias = (
-                        df_err_cal.groupby(["season", "hour"])["err"].mean().to_dict()
-                    )
-
-                    self.bias_correctors[t][h_int] = {
-                        "global": global_hourly_bias,
-                        "seasonal": seasonal_bias,
-                    }
-
-                    val_hours = dates_h_val.dt.hour
-                    val_seasons = dates_h_val.dt.month.apply(get_season_name)
-
-                    bias_h_val = array(
-                        [
-                            seasonal_bias.get(
-                                (s, h_pt), global_hourly_bias.get(h_pt, 0.0)
-                            )
-                            for s, h_pt in zip(val_seasons, val_hours)
-                        ]
-                    )
-
-                    bias_h_cal = array(
-                        [
-                            seasonal_bias.get(
-                                (s, h_pt), global_hourly_bias.get(h_pt, 0.0)
-                            )
-                            for s, h_pt in zip(cal_seasons, cal_hours)
-                        ]
-                    )
-
-                    bias_corrections_val_list.append(bias_h_val)
-                    bias_corrections_cal_list.append(bias_h_cal)
-
-                    start_idx = end_idx
-                    start_idx_cal = end_idx_cal
-
-                # Application of corrections
-                preds_val_corrected = array(preds_val).ravel() + concatenate(
-                    bias_corrections_val_list
-                )
-                preds_cal_corrected = array(preds_cal).ravel() + concatenate(
-                    bias_corrections_cal_list
-                )
+                preds_val_corrected = apply_bias_correction(
+                    X_val,
+                    bias_corrector,
+                    t,
+                    Series(preds_val, index=X_val.index),
+                ).to_numpy()
+                preds_cal_corrected = apply_bias_correction(
+                    X_cal_eval,
+                    bias_corrector,
+                    t,
+                    Series(preds_cal, index=X_cal_eval.index),
+                ).to_numpy()
 
                 # --- CALCULATION OF METRICS ---
                 if t == "precip":
-                    preds_val_corrected = maximum(0, preds_val_corrected)
-                    preds_cal_corrected = maximum(0, preds_cal_corrected)
-                elif t in ["wind", "gusts", "cloud", "hum"]:
-                    preds_val_corrected = maximum(0, preds_val_corrected)
-                    preds_cal_corrected = maximum(0, preds_cal_corrected)
+                    if precip_val_probs is None:
+                        raise RuntimeError(
+                            "Precipitation validation probabilities were not computed."
+                        )
+                    if len(precip_val_probs) != len(preds_val):
+                        raise ValueError(
+                            "Precipitation probabilities and regression predictions "
+                            "must align."
+                        )
+                    rain_signal = precip_val_probs >= optimal_threshold
+                    prob_model = job_load(
+                        self.path / f"model_precip_prob_{block_name}.pkl"
+                    )
+                    X_cal_prob = (
+                        X_cal_eval.drop(columns=["time_step"])
+                        if "time_step" in X_cal_eval.columns
+                        else X_cal_eval
+                    )
+                    cal_rain_probs = prob_model.predict_proba(X_cal_prob)[:, 1]
+                    del prob_model, X_cal_prob
+                    if len(cal_rain_probs) != len(preds_cal_corrected):
+                        raise ValueError(
+                            "Precipitation calibration probabilities and regression "
+                            "predictions must align."
+                        )
+                    preds_val = where(rain_signal, preds_val, 0.0)
+                    preds_val_corrected = where(
+                        rain_signal, preds_val_corrected, 0.0
+                    )
+                    preds_cal = where(
+                        cal_rain_probs >= optimal_threshold, preds_cal, 0.0
+                    )
+                    preds_cal_corrected = where(
+                        cal_rain_probs >= optimal_threshold,
+                        preds_cal_corrected,
+                        0.0,
+                    )
+                preds_val = _constrain_prediction(t, preds_val)
+                preds_val_corrected = _constrain_prediction(
+                    t, preds_val_corrected
+                )
+                preds_cal = _constrain_prediction(t, preds_cal)
+                preds_cal_corrected = _constrain_prediction(
+                    t, preds_cal_corrected
+                )
 
-                    if t in ["hum", "cloud"]:
-                        preds_val_corrected = minimum(100, preds_val_corrected)
-                        preds_cal_corrected = minimum(100, preds_cal_corrected)
+                metric_actual = _metric_values(t, y_val)
+                raw_validation_error = _primary_error(
+                    t, metric_actual, _metric_values(t, preds_val)
+                )
+                corrected_validation_error = _primary_error(
+                    t, metric_actual, _metric_values(t, preds_val_corrected)
+                )
+                if corrected_validation_error >= raw_validation_error:
+                    logger.warning(
+                        f"Bias correction rejected for {t}/{block_name}: "
+                        f"validation error {corrected_validation_error:.4f} "
+                        f">= raw error {raw_validation_error:.4f}."
+                    )
+                    bias_corrector = None
+                    preds_val_corrected = preds_val.copy()
+                    preds_cal_corrected = preds_cal.copy()
 
                 # Deleting temp files
                 for name in [
                     f"X_cal_{t}_{block_name}.parquet",
                     f"y_cal_{t}_{block_name}.pkl",
+                    f"X_cal_eval_{t}_{block_name}.parquet",
+                    f"y_cal_eval_{t}_{block_name}.pkl",
+                    f"X_cal_threshold_{t}_{block_name}.parquet",
+                    f"y_cal_threshold_{t}_{block_name}.pkl",
                 ]:
                     path = self.path / name
                     if path.exists():
@@ -728,62 +816,6 @@ class TrainingLoopMixin:
                             early_stopping(stopping_rounds=100),
                         ],
                     )
-                    m_low_best_it = (
-                        m_low.best_iteration_
-                        if (m_low.best_iteration_ and m_low.best_iteration_ > 0)
-                        else m_low.n_estimators
-                    )
-                    m_high_best_it = (
-                        m_high.best_iteration_
-                        if (m_high.best_iteration_ and m_high.best_iteration_ > 0)
-                        else m_high.n_estimators
-                    )
-                    total_steps = (
-                        total_steps - steps_quantile + m_low_best_it + m_high_best_it
-                    )
-                    step = step + m_low_best_it + m_high_best_it
-
-                if t == "precip":
-                    logger.info('Quantiles Rain...')
-                    precip_quantile_params = quantile_params.copy()
-                    precip_quantile_params["metric"] = "tweedie"
-                    precip_quantile_params["tweedie_variance_power"] = 1.5
-
-                    # ✅ LIGHTGBM CORRECTION: eval_X/eval_y
-                    m_low = LGBMRegressor(alpha=0.1, **precip_quantile_params).fit(
-                        X_tr,
-                        y_tr,
-                        eval_set=[(X_val, y_val)],
-                        callbacks=[
-                            log_evaluation(0),
-                            early_stopping(stopping_rounds=100),
-                        ],
-                    )
-                    m_high = LGBMRegressor(alpha=0.9, **precip_quantile_params).fit(
-                        X_tr,
-                        y_tr,
-                        eval_set=[(X_val, y_val)],
-                        callbacks=[
-                            log_evaluation(0),
-                            early_stopping(stopping_rounds=100),
-                        ],
-                    )
-                    m_high_best_it = (
-                        m_high.best_iteration_
-                        if (m_high.best_iteration_ and m_high.best_iteration_ > 0)
-                        else m_high.n_estimators
-                    )
-                    m_low_best_it = (
-                        m_low.best_iteration_
-                        if (m_low.best_iteration_ and m_low.best_iteration_ > 0)
-                        else m_low.n_estimators
-                    )
-                    total_steps = (
-                        total_steps - steps_quantile + m_low_best_it + m_high_best_it
-                    )
-                    step = step + m_low_best_it + m_high_best_it
-
-                bias_corrector = self.bias_correctors[t]
                 bundle = {
                     "model": model,
                     "m_low": m_low,
@@ -794,45 +826,56 @@ class TrainingLoopMixin:
                 }
                 if t == "precip":
                     bundle["optimal_threshold"] = optimal_threshold
+                    bundle["precip_strategy_version"] = 3
                 job_dump(bundle, self.path / f"model_{t}_{block_name}.pkl", compress=6)
                 job_dump(meta_data, self.path / "global_meta.pkl")
 
-                # Assessment
-                from sklearn.metrics import (
-                    mean_absolute_error,
-                    mean_pinball_loss,
-                    root_mean_squared_error,
-                )
+                # Assessment uses physical units and disjoint calibration evaluation rows.
+                from sklearn.metrics import mean_pinball_loss
 
-                y_tr_metric, y_val_metric, y_cal_metric = y_tr, y_val, y_cal
-                preds_val_metric, preds_val_corr_metric, preds_cal_corr_metric = (
-                    preds_val,
-                    preds_val_corrected,
-                    preds_cal_corrected,
+                y_tr_metric = _metric_values(t, y_tr)
+                y_val_metric = _metric_values(t, y_val)
+                y_cal_metric = _metric_values(t, y_cal_eval)
+                preds_val_metric = _metric_values(t, preds_val)
+                preds_val_corr_metric = _metric_values(t, preds_val_corrected)
+                preds_cal_corr_metric = _metric_values(t, preds_cal_corrected)
+                preds_tr_base = _constrain_prediction(t, model.predict(X_tr))
+                preds_tr_metric = _metric_values(t, preds_tr_base)
+
+                raw_metrics = regression_metrics(y_val_metric, preds_val_metric)
+                corrected_metrics = regression_metrics(
+                    y_val_metric, preds_val_corr_metric
                 )
-                preds_tr_base = model.predict(X_tr)
-                if t == "precip":
-                    y_tr_metric = decode_rain_target(y_tr_metric)
-                    y_val_metric = decode_rain_target(y_val_metric)
-                    y_cal_metric = decode_rain_target(y_cal_metric)
-                    preds_val_metric = decode_rain_target(preds_val_metric)
-                    preds_val_corr_metric = decode_rain_target(preds_val_corr_metric)
-                    preds_cal_corr_metric = decode_rain_target(preds_cal_corr_metric)
-                    preds_tr_base = decode_rain_target(preds_tr_base)
+                calibration_metrics = regression_metrics(
+                    y_cal_metric, preds_cal_corr_metric
+                )
+                train_metrics = regression_metrics(y_tr_metric, preds_tr_metric)
 
                 if t in ["wind", "gusts", "hum"]:
-                    main_metric_str = f"Val RMSE: {root_mean_squared_error(y_val_metric, preds_val_metric):.3f} | Corr: {root_mean_squared_error(y_val_metric, preds_val_corr_metric):.3f}"
+                    primary_raw = raw_metrics["rmse"]
+                    primary_corrected = corrected_metrics["rmse"]
+                    primary_name = "RMSE"
                 else:
-                    main_metric_str = f"Val MAE: {mean_absolute_error(y_val_metric, preds_val_metric):.3f} | Corr: {mean_absolute_error(y_val_metric, preds_val_corr_metric):.3f}"
+                    primary_raw = raw_metrics["mae"]
+                    primary_corrected = corrected_metrics["mae"]
+                    primary_name = "MAE"
 
                 q10_str, q90_str = "N/A", "N/A"
+                quantile_metric_mask = (
+                    y_val_metric > 0.1
+                    if conditional_precipitation
+                    else slice(None)
+                )
+                quantile_metric_target = y_val_metric[quantile_metric_mask]
                 if m_low is not None:
                     q10_preds = m_low.predict(X_val)
                     if t == "cloud":
                         q10_preds = q10_preds * 100.0
                     elif t == "precip":
                         q10_preds = decode_rain_target(q10_preds)
-                    q10_str = f"Pinball: {mean_pinball_loss(y_val_metric, q10_preds, alpha=0.1):.3f}"
+                    q10_str = (
+                        f"{mean_pinball_loss(quantile_metric_target, q10_preds[quantile_metric_mask], alpha=0.1):.3f}"
+                    )
 
                 if m_high is not None:
                     q90_preds = m_high.predict(X_val)
@@ -840,21 +883,77 @@ class TrainingLoopMixin:
                         q90_preds = q90_preds * 100.0
                     elif t == "precip":
                         q90_preds = decode_rain_target(q90_preds)
-                    q90_str = f"Pinball: {mean_pinball_loss(y_val_metric, q90_preds, alpha=0.9):.3f}"
+                    q90_str = (
+                        f"{mean_pinball_loss(quantile_metric_target, q90_preds[quantile_metric_mask], alpha=0.9):.3f}"
+                    )
 
-                mae_val_base = mean_absolute_error(y_val_metric, preds_val_metric)
-                mae_tr_base = mean_absolute_error(y_tr_metric, preds_tr_base)
-                ratio_overfit = mae_val_base / mae_tr_base if mae_tr_base > 0 else nan
+                if t == "precip":
+                    train_wet = y_tr_metric > 0.1
+                    validation_wet = y_val_metric > 0.1
+                    if train_wet.any() and validation_wet.any():
+                        train_metrics = regression_metrics(
+                            y_tr_metric[train_wet], preds_tr_metric[train_wet]
+                        )
+                        wet_validation_predictions = _metric_values(
+                            t,
+                            _constrain_prediction(t, preds_val_unthresholded),
+                        )
+                        wet_validation_metrics = regression_metrics(
+                            y_val_metric[validation_wet],
+                            wet_validation_predictions[validation_wet],
+                        )
+                        overfit_ratio = (
+                            wet_validation_metrics["mae"] / train_metrics["mae"]
+                            if train_metrics["mae"] > 0
+                            else nan
+                        )
+                    else:
+                        overfit_ratio = nan
+                else:
+                    overfit_ratio = (
+                        raw_metrics["mae"] / train_metrics["mae"]
+                        if train_metrics["mae"] > 0
+                        else nan
+                    )
 
-                mae_val_corr = mean_absolute_error(y_val_metric, preds_val_corr_metric)
-                mae_cal_corr = mean_absolute_error(y_cal_metric, preds_cal_corr_metric)
-                ratio_calib = mae_val_corr / mae_cal_corr if mae_cal_corr > 0 else nan
+                error_delta = primary_corrected - primary_raw
+                mae_delta = corrected_metrics["mae"] - raw_metrics["mae"]
+                mae_ratio = (
+                    corrected_metrics["mae"] / raw_metrics["mae"]
+                    if raw_metrics["mae"] > 0
+                    else nan
+                )
+                task_duration = perf_counter() - start_time_model
+                eta_estimator.record(block_name, task_duration)
+                eta_seconds, eta_coverage = eta_estimator.estimate_remaining()
+                if eta_seconds == 0:
+                    eta_text = "remaining tasks complete"
+                elif eta_seconds is None:
+                    eta_text = "warming up"
+                else:
+                    eta_text = (
+                        f"~{eta_seconds / 3600:.1f}h remaining "
+                        f"(block-history coverage {eta_coverage:.0%})"
+                    )
 
-                logger.info(f"""[{t} | {block_name.upper()}] {(time() - start_time_model) / 60:.1f}min. {step}/{total_steps}
-    ETA: {(total_steps / step) * (time() - start_time) / 3600:.1f}h | {main_metric_str}
-    MAE Phys: {mae_val_base:.2f} -> Corr: {mae_val_corr:.2f} | Gain: {mae_val_corr / mae_val_base:.2f}
-    Overfit: {ratio_overfit:.2f} | Calib: {ratio_calib:.2f}
-    Quantiles: [10% {q10_str}] | [90% {q90_str}]""")
+                logger.info(
+                    f"[{t} | {block_name.upper()}] {task_duration / 60:.1f}min. "
+                    f"{eta_estimator.completed_count}/{len(pending_tasks)} tasks | "
+                    f"ETA: {eta_text}\n"
+                    f"    Val MAE raw/corrected: {raw_metrics['mae']:.3f}/"
+                    f"{corrected_metrics['mae']:.3f} (delta {mae_delta:+.3f}, "
+                    f"ratio {mae_ratio:.3f}) | "
+                    f"RMSE raw/corrected: {raw_metrics['rmse']:.3f}/"
+                    f"{corrected_metrics['rmse']:.3f}\n"
+                    f"    Pearson r raw/corrected: "
+                    f"{raw_metrics['pearson_r']:.3f}/"
+                    f"{corrected_metrics['pearson_r']:.3f} | "
+                    f"{primary_name} delta: {error_delta:+.3f}\n"
+                    f"    Train MAE: {train_metrics['mae']:.3f} | "
+                    f"Calibration holdout MAE: {calibration_metrics['mae']:.3f} | "
+                    f"Wet-event MAE val/train: {overfit_ratio:.3f}\n"
+                    f"    Quantile pinball: q10={q10_str} | q90={q90_str}"
+                )
 
                 # Final Cleaning
                 if hasattr(model, "final_estimator_"):
@@ -872,18 +971,19 @@ class TrainingLoopMixin:
                 if hasattr(model, "free_dataset"):
                     model.free_dataset()
 
-                del X_tr, y_tr, X_val, y_val, X_cal, y_cal
+                del X_tr, y_tr, X_val, y_val, X_cal, y_cal, X_cal_eval, y_cal_eval
                 del (
                     model,
                     preds_val,
                     preds_cal,
+                    preds_cal_fit,
                     bias_corrector,
                     preds_cal_corrected,
                     weights,
                 )
-                del bias_corrections_val_list, bias_corrections_cal_list, importances
+                del importances
                 MemoryManager.trim_memory()
 
         logger.info(
-            f"\n🎉 Training completed in {(time() - start_time) / 3600:.1f}h !"
+            f"\n🎉 Training completed in {(perf_counter() - start_time) / 3600:.1f}h !"
         )

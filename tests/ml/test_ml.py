@@ -9,6 +9,7 @@ from ml.ml_models import (
 )
 from ml.bias_correction import apply_bias_correction
 from ml.predictor import WeatherPredictor
+from training.bias_corrector import fit_bias_corrector
 
 
 class ConstantEstimator:
@@ -43,6 +44,117 @@ def test_bias_correction_applies_fitted_delta():
     )
 
     assert np.allclose(result, [1.5, 2.5])
+
+
+def test_predictor_uses_neutral_values_for_unavailable_synoptic_deltas(caplog):
+    predictor = WeatherPredictor.__new__(WeatherPredictor)
+    predictor.meta = {"features": ["temperature"]}
+
+    class Model:
+        feature_name_ = ["temperature", "w_macro_temp_delta"]
+
+    result = predictor._select_model_features(
+        pd.DataFrame({"temperature": [12.0]}),
+        {"features": ["temperature", "w_macro_temp_delta"]},
+        Model(),
+        "temp",
+        "short",
+    )
+
+    assert list(result.columns) == ["temperature", "w_macro_temp_delta"]
+    assert np.allclose(result["w_macro_temp_delta"], [0.0])
+    assert "using neutral zero" in caplog.text
+
+
+def test_predictor_still_rejects_missing_non_delta_features():
+    predictor = WeatherPredictor.__new__(WeatherPredictor)
+    predictor.meta = {"features": ["temperature"]}
+
+    class Model:
+        feature_name_ = ["temperature", "pressure"]
+
+    with pytest.raises(ValueError, match="Missing features for temp/short"):
+        predictor._select_model_features(
+            pd.DataFrame({"temperature": [12.0]}),
+            {"features": ["temperature", "pressure"]},
+            Model(),
+            "temp",
+            "short",
+        )
+
+
+def test_bias_corrector_learns_residuals_without_time_step():
+    feature = np.tile([0.0, 1.0], 400)
+    features = pd.DataFrame(
+        {
+            "horizon_h": np.ones(len(feature), dtype=np.float32),
+            "target_solar_elev": feature,
+            "target_hour_sin": np.zeros(len(feature), dtype=np.float32),
+            "target_hour_cos": np.ones(len(feature), dtype=np.float32),
+            "target_month_sin": np.zeros(len(feature), dtype=np.float32),
+            "target_month_cos": np.ones(len(feature), dtype=np.float32),
+            "irrelevant_feature": np.arange(len(feature), dtype=np.float32),
+            "time_step": np.arange(len(feature), dtype=np.int32),
+        }
+    )
+    residuals = np.where(feature > 0.5, 4.0, -2.0)
+
+    corrector = fit_bias_corrector(
+        features,
+        pd.Series(residuals, dtype=np.float32),
+        np.zeros(len(feature), dtype=np.float32),
+    )
+
+    assert corrector.feature_names_in_.tolist() == [
+        "predictions",
+        "horizon_h",
+        "target_solar_elev",
+        "target_hour_sin",
+        "target_hour_cos",
+        "target_month_sin",
+        "target_month_cos",
+    ]
+    inference = features.iloc[[0, 1]].drop(columns=["irrelevant_feature", "time_step"])
+    correction = apply_bias_correction(
+        inference,
+        corrector,
+        "temp",
+        pd.Series([0.0, 0.0]),
+    )
+    assert correction[1] > correction[0] + 3
+
+
+def test_legacy_bias_correction_uses_horizon_hour_and_season():
+    features = pd.DataFrame(
+        {
+            "horizon_h": [1.0, 1.0],
+            "target_hour_sin": [0.0, 0.0],
+            "target_hour_cos": [1.0, 1.0],
+            "target_month_sin": [
+                np.sin(2 * np.pi * 1 / 12),
+                np.sin(2 * np.pi * 12 / 12),
+            ],
+            "target_month_cos": [
+                np.cos(2 * np.pi * 1 / 12),
+                np.cos(2 * np.pi * 12 / 12),
+            ],
+        }
+    )
+    legacy_corrector = {
+        1: {
+            "global": {0: 0.25},
+            "seasonal": {("winter", 0): 0.5},
+        }
+    }
+
+    result = apply_bias_correction(
+        features,
+        legacy_corrector,
+        "temp",
+        pd.Series([10.0, 10.0]),
+    )
+
+    assert np.allclose(result, [10.5, 10.5])
 
 
 def test_inplace_preprocessor_preserves_shape_and_scales_values():

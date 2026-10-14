@@ -1,5 +1,5 @@
 """
-inference.py
+ml.batch_predictor
  MLOps inference layer for WeatherMaster.
 Isolates API patches and vector inference by batch
 without relying on a monolithic forecast script.
@@ -114,4 +114,3 @@ class BatchWeatherPredictor(WeatherPredictor):
     WeatherPredictor extension for batch matrix inference.
     Reduces inference time from 168 sequential calls to 3 vector calls.
     """
-

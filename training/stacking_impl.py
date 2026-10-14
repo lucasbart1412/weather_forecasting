@@ -6,7 +6,7 @@ import numpy as np
 from training._runtime import *
 from training.memory_impl import MemoryManager
 from sklearn.base import BaseEstimator, RegressorMixin, clone
-from models import InplacePredictPreprocessor
+from ml.models_impl import InplacePredictPreprocessor
 
 class TimeSeriesStackingTrainer(BaseEstimator, RegressorMixin):
     """
@@ -476,18 +476,26 @@ class TimeSeriesStackingTrainer(BaseEstimator, RegressorMixin):
             else:
                 model_step = pipe
 
-            if hasattr(model_step, "feature_importances_"):
-                imp = model_step.feature_importances_
-                total_imp = imp.sum()
-                if total_imp > 0:
-                    importances_list.append(imp / total_imp)
-                else:
-                    importances_list.append(imp)
+            importances = getattr(model_step, "feature_importances_", None)
+            if importances is None:
+                continue
+
+            importances = np.asarray(importances, dtype=float).reshape(-1)
+            if not np.isfinite(importances).all() or (importances < 0).any():
+                raise ValueError("Feature importances must be finite and non-negative.")
+
+            total_importance = importances.sum()
+            if total_importance > 0:
+                importances_list.append(importances / total_importance)
 
         if not importances_list:
             raise AttributeError("No model has a 'feature_importances_' attribute")
 
-        return mean(array(importances_list), axis=0)
+        feature_counts = {len(importances) for importances in importances_list}
+        if len(feature_counts) != 1:
+            raise ValueError("Base models must have the same number of feature importances.")
+
+        return np.mean(importances_list, axis=0)
 
     def predict(self, X: Any) -> np.ndarray:
         """Generates predictions via trained stacking."""

@@ -43,14 +43,28 @@ def test_modular_packages_have_package_initializers():
     assert all((ROOT / package / "__init__.py").exists() for package in MODULAR_PACKAGES)
 
 
-def test_public_compatibility_facades_exist():
+def test_package_public_modules_exist():
     expected = {
         "feature_engineering/feature_engineering.py",
         "ml/models_impl.py",
         "ml/weather_predictor_impl.py",
         "training/model_manager_impl.py",
+        "training/pipeline.py",
+        "model_evaluation/cli.py",
+        "train.py",
+        "eval_model.py",
     }
     assert all((ROOT / path).exists() for path in expected)
+
+
+def test_unused_root_compatibility_facades_are_removed():
+    removed = {
+        "config.py",
+        "inference.py",
+        "models.py",
+        "main.py",
+    }
+    assert all(not (ROOT / path).exists() for path in removed)
 
 
 def test_regular_modular_modules_respect_line_limit():

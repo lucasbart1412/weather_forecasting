@@ -155,13 +155,3 @@ def main():
 
     logger.info(f"🎉 Pipeline finished! Models in: {path}")
 
-
-def _legacy_main():
-    """Delegates CLI execution to the package training orchestrator."""
-    from training.pipeline import main as pipeline_main
-
-    return pipeline_main()
-
-
-if __name__ == "__main__":
-    main()

@@ -14,7 +14,37 @@ __all__ = [
     "sunrise_sunset_",
     "build_daily_aggregate",
     "plot_hourly",
+    "chart_variable_options",
+    "filter_short_term_precipitation",
 ]
+
+VARIABLE_OPTIONS = {
+    "🌡️ Temperature": "temp",
+    "🌧️ Rain & Probability": "precip",
+    "💨 Wind": "wind",
+    "☁️ Cloud Cover": "cloud",
+    "💦 Humidity": "hum",
+    "🌊 Tides": "tide",
+}
+SHORT_HORIZON_MAX_HOURS = 18
+
+
+def chart_variable_options(*, include_precipitation: bool) -> dict[str, str]:
+    """Return variables available for a chart's forecast horizon."""
+    if include_precipitation:
+        return VARIABLE_OPTIONS.copy()
+    return {
+        label: variable
+        for label, variable in VARIABLE_OPTIONS.items()
+        if variable != "precip"
+    }
+
+
+def filter_short_term_precipitation(df_pred: pd.DataFrame) -> pd.DataFrame:
+    """Keep precipitation forecasts within the trained short-horizon block."""
+    if "horizon_h" not in df_pred.columns:
+        raise ValueError("Forecast data must include the 'horizon_h' column.")
+    return df_pred.loc[df_pred["horizon_h"] <= SHORT_HORIZON_MAX_HOURS]
 
 
 def safe_float(val, default=0.0):
@@ -201,47 +231,51 @@ def plot_hourly(df_pred: pd.DataFrame, variable: str):
         elif (
             variable == "precip"
             and "precip" in df_pred.columns
-            and (
-                df_pred["precip"].var() != 0
-                or (
-                    "precip_prob" in df_pred.columns
-                    and df_pred["precip_prob"].var() != 0
+            and pd.to_numeric(df_pred["precip"], errors="coerce").notna().any()
+        ):
+            precip_values = pd.to_numeric(df_pred["precip"], errors="coerce")
+            fig.add_trace(
+                go.Bar(
+                    x=df_pred["time"],
+                    y=precip_values,
+                    name="Precipitation (mm)",
+                    marker_color="#4a90d9",
+                    yaxis="y1",
                 )
             )
-        ):
-            if df_pred["precip"].var() != 0:
-                fig.add_trace(
-                    go.Bar(
-                        x=df_pred["time"],
-                        y=df_pred["precip"],
-                        name="Precipitation (mm)",
-                        marker_color="#4a90d9",
-                        yaxis="y1",
-                    )
-                )
+            layout_axes = {
+                "yaxis": {
+                    "title": "Precipitation (mm)",
+                    "rangemode": "tozero",
+                    "range": [0, max(1.0, float(precip_values.max(skipna=True)) * 1.1)],
+                }
+            }
             if (
                 "precip_prob" in df_pred.columns
-                and df_pred["precip_prob"].var() != 0
+                and pd.to_numeric(df_pred["precip_prob"], errors="coerce")
+                .notna()
+                .any()
             ):
+                probability_values = pd.to_numeric(
+                    df_pred["precip_prob"], errors="coerce"
+                )
                 fig.add_trace(
                     go.Scatter(
                         x=df_pred["time"],
-                        y=df_pred["precip_prob"],
+                        y=probability_values,
                         name="Probability (%)",
                         line=dict(color="#c77dff", width=2),
                         yaxis="y2",
                     )
                 )
-            fig.update_layout(
-                yaxis=dict(title="mm"),
-                yaxis2=dict(
+                layout_axes["yaxis2"] = dict(
                     title="%",
                     overlaying="y",
                     side="right",
                     range=[0, 100],
                     showgrid=False,
-                ),
-            )
+                )
+            fig.update_layout(**layout_axes)
         elif (
             variable == "wind"
             and "wind" in df_pred.columns

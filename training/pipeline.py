@@ -1,9 +1,4 @@
-"""Public orchestrator of the training pipeline.
-
-Historical implementations remain unchanged in `train.py` during the
-migration. This layer composes their responsibilities and provides the point
-input called by the root command.
-"""
+"""Public entry point for the training pipeline."""
 
 from training.bias_corrector import train_bias_correctors
 from training.memory_impl import MemoryManager
@@ -15,7 +10,7 @@ from training.stacking_impl import TimeSeriesStackingTrainer
 
 
 def main() -> None:
-    """Launches the moved drive pipeline into the package."""
+    """Run the training command-line interface."""
     return implementation_main()
 
 

@@ -78,6 +78,8 @@ class ModelFactoryMixin:
                         "tweedie_variance_power": 1.5,
                         "learning_rate": 0.015,
                         "colsample_bytree": 0.7,
+                        "reg_alpha": 2.0,
+                        "reg_lambda": 5.0,
                     }
                 )
                 xgb_params.update(
@@ -85,9 +87,16 @@ class ModelFactoryMixin:
                         "objective": "reg:tweedie",
                         "tweedie_variance_power": 1.5,
                         "colsample_bytree": 0.7,
+                        "reg_alpha": 2.0,
+                        "reg_lambda": 5.0,
                     }
                 )
-                cat_params.update({"loss_function": "Tweedie:variance_power=1.5"})
+                cat_params.update(
+                    {
+                        "loss_function": "Tweedie:variance_power=1.5",
+                        "l2_leaf_reg": 10.0,
+                    }
+                )
                 final_estimator = TweedieRegressor(power=1.5, link="log", max_iter=500)
 
             elif target_type in ["wind", "gusts"]:
@@ -272,4 +281,3 @@ class ModelFactoryMixin:
                 params.update({"objective": "regression"})
 
             return LGBMRegressor(**params)
-

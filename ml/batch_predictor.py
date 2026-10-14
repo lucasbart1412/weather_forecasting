@@ -1,5 +1,5 @@
 """
-inference.py
+ml.batch_predictor
  MLOps inference layer for WeatherMaster.
 Isolates API patches and vector inference by batch
 without relying on the removed monolithic forecast script.
@@ -36,28 +36,6 @@ class BatchWeatherPredictor(WeatherPredictor):
     def __init__(self, base_path):
         super().__init__(base_path)
         self._prob_model_cache = {}
-
-    def _feature_names_for(self, bundle, estimator):
-        """Return the feature schema actually used by an estimator."""
-        model_features = getattr(estimator, "feature_name_", None)
-        if model_features:
-            return [name for name in model_features if name != "time_step"]
-        return [
-            name
-            for name in bundle.get("features", self.meta["features"])
-            if name != "time_step"
-        ]
-
-    def _select_model_features(self, df, bundle, estimator, target, block):
-        model_features = self._feature_names_for(bundle, estimator)
-        missing_features = [
-            name for name in model_features if name not in df.columns
-        ]
-        if missing_features:
-            raise ValueError(
-                f"Missing features for {target}/{block}: {missing_features}"
-            )
-        return df.loc[:, model_features].astype("float32")
 
     def _predict_batch_precip(self, block, df, idx, res):
         """Vectorized subroutine for rain (quantity + probability)."""
@@ -118,16 +96,17 @@ class BatchWeatherPredictor(WeatherPredictor):
                 block,
             )
             raw_pred = bundle["model"].predict(X_model)
-            try:
-                bias = apply_bias_correction(
-                    bias_model=bundle["bias_corrector"],
-                    df_inference=X_model,
+            bias_corrector = bundle.get("bias_corrector")
+            if bias_corrector is not None:
+                corrected_pred = apply_bias_correction(
+                    bias_model=bias_corrector,
+                    df_inference=df.iloc[idx],
                     target="precip",
                     df_predictions=pd.Series(raw_pred, index=X_model.index),
                 ).values
-            except Exception:
-                bias = 0.0
-            corrected_pred = np.maximum(0, raw_pred + bias)
+            else:
+                corrected_pred = raw_pred
+            corrected_pred = np.maximum(0, corrected_pred)
             qty = decode_model_target(
                 "precip", corrected_pred, bundle.get("target_transform")
             )
@@ -144,7 +123,7 @@ class BatchWeatherPredictor(WeatherPredictor):
     ) -> pd.DataFrame:
         """
         Vectorized version of `WeatherPredictor.predict()`.
-        NEVER raise an exception: silent fallback + log.
+        Logs target-level failures and keeps the remaining horizons available.
         """
         if not hasattr(self, "_prob_model_cache"):
             self._prob_model_cache = {}
@@ -156,7 +135,22 @@ class BatchWeatherPredictor(WeatherPredictor):
         horizons_arr = np.asarray(horizons, dtype="float64")
         last_row = df_live.iloc[-1]
 
-        base_dict = {f: last_row.get(f, 0) for f in self.meta["features"]}
+        inference_features = set(self.meta["features"])
+        for target_bundles in self.models.values():
+            for bundle in target_bundles.values():
+                inference_features.update(
+                    self._feature_names_for(bundle, bundle["model"])
+                )
+
+        base_dict = {}
+        for feature in inference_features:
+            value = last_row.get(feature, 0)
+            if (
+                self._is_neutral_synoptic_delta(feature)
+                and (feature not in last_row.index or pd.isna(value))
+            ):
+                continue
+            base_dict[feature] = value
         df = pd.DataFrame([base_dict] * n).reset_index(drop=True)
         for col in df.columns:
             df[col] = (
@@ -246,17 +240,16 @@ class BatchWeatherPredictor(WeatherPredictor):
                     if t == "cloud":
                         raw_pred = np.clip(raw_pred, 0.0, 100.0)
 
-                    try:
-                        bias = apply_bias_correction(
-                            bias_model=bundle["bias_corrector"],
-                            df_inference=X_model,
+                    bias_corrector = bundle.get("bias_corrector")
+                    if bias_corrector is not None:
+                        prediction_finale = apply_bias_correction(
+                            bias_model=bias_corrector,
+                            df_inference=df.iloc[idx],
                             target=t,
                             df_predictions=pd.Series(raw_pred, index=X_model.index),
                         ).values
-                    except Exception:
-                        bias = 0.0
-
-                    prediction_finale = raw_pred + bias
+                    else:
+                        prediction_finale = raw_pred
 
                     if t in ["temp", "press", "hum"]:
                         climatology_dict = self.meta.get("clima", {}).get(t, {})

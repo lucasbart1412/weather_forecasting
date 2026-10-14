@@ -3,8 +3,8 @@
 ## 1. Objectives
 
 Weather Forecast is organized around explicit responsibilities: data
-collection, feature preparation, inference, and training are
-separated, while the root modules retain the historical entry points.
+collection, feature preparation, inference, and training are separated into
+their domain packages.
 
 This organization preserves the expected business behaviors while improving:
 - readability and localization of the code;
@@ -96,9 +96,26 @@ The modules in `training/` share their common technical dependencies via
 the models, Optuna, LightGBM, and memory management, in order to avoid
 repeating the same imports at the beginning of each module.
 
+Forecast bias is learned from chronologically separated calibration periods:
+one fits the residual corrector, one tunes precipitation thresholds, and one
+measures held-out calibration performance, with horizon-sized gaps between
+periods. The Ridge corrector uses only the raw forecast, horizon, solar
+elevation, and cyclic hour/month features. It is retained only when it improves
+the primary validation error. Precipitation evaluation reports regression
+errors in physical units and keeps threshold-tuning metrics separate from
+validation metrics. Training progress estimates remaining time from observed
+task durations, using per-block history where available. Existing bundles that
+contain the earlier hour/season correction tables remain readable during
+migration.
+
 ### Presentation
 
 The presentation collects user inputs and displays the outputs. Feature calculations and predictions remain in their respective packages. The dashboard helpers keep chart generation and date formatting separate from the main UI flow so the Streamlit page stays easier to follow.
+
+Precipitation charts are limited to the short forecast block (up to 18 hours).
+Precipitation is not offered in the selected-day or 7-day hourly charts because
+those views include medium- and long-horizon forecasts. Daily precipitation
+totals remain available in the overview cards.
 
 ## 4. Path and artifact resolution
 
@@ -124,13 +141,13 @@ The bundles contain the model, the expected features, the bias correctors and, w
 
 ## 5. Data Flow
 
-1. Streamlit asks the user for a city or a location.  
-2. `infrastructure.geo_api` reads the cache or uses the geocoding service.  
-3. `DataFetcher` retrieves hourly weather and marine data.  
-4. `FeatureEngineer` reindexes the series and adds climatology, cycles, physics and lags.  
-5. Training shifts future precipitation targets and encodes their quantities with `log1p`; other targets and all predictor features are unchanged.  
-6. The predictor loads the expected metadata and bundles.  
-7. `BatchWeatherPredictor` builds a matrix for all horizons and decodes tagged precipitation models with `expm1`.  
+1. Streamlit asks the user for a city or a location.
+2. `infrastructure.geo_api` reads the cache or uses the geocoding service.
+3. `DataFetcher` retrieves hourly weather and marine data.
+4. `FeatureEngineer` reindexes the series and adds climatology, cycles, physics and lags.
+5. Training shifts future precipitation targets and encodes their quantities with `log1p`; other targets and all predictor features are unchanged.
+6. The predictor loads the expected metadata and bundles.
+7. `BatchWeatherPredictor` builds a matrix for all horizons and decodes tagged precipitation models with `expm1`.
 8. The outputs are bounded in physical units and use the current observation as a fallback.
 9. Evaluation also decodes tagged precipitation predictions before computing metrics.
 10. The presentation renders the results without recalculating the business logic.
@@ -168,12 +185,11 @@ The tests are organized around the following boundaries:
 | Weather API| Geocoding | simulated session or response |
 | Joblib | dummy artifacts and models |
 | Models | sklearn objects with `predict` || File system | `tmp_path` pytest |
-| Architecture | testing facades, packages and size limits |
+| Architecture | testing package modules, entry points and size limits |
 
 No unit test requires an Internet connection, a heavy model, or an absolute path specific to the development machine.
 
-## 8. Compatibility
-The root-level scripts (`config.py`, `inference.py`, `models.py`, `train.py`, `eval_model.py`) act as compatibility entry points and preserve the historical import paths expected by older scripts and notebooks.
+## 8. Package entry points
 
 The main business objects are:
 
@@ -181,6 +197,19 @@ The main business objects are:
 - `InplacePredictPreprocessor` and `TimeSeriesStackingRegressor` in `ml/models_impl.py`;
 - `WeatherPredictor` in `ml/weather_predictor_impl.py`;
 - `ModelManager` in `training/model_manager_impl.py`.
+
+The dashboard is launched with `streamlit run app.py` and imports batch
+inference directly from `ml.batch_predictor`. Root-level training and
+evaluation launchers delegate to their package implementations:
+
+```bash
+python3 train.py --city Paris
+python3 eval_model.py --base-dir ./binary
+```
+
+The unused root facades for configuration, batch inference, serialized model
+classes, and the duplicate dashboard launcher have been removed. The package
+modules remain the implementation and import interfaces.
 
 The new regular modules target a limit of 300 lines. The few historical orchestrators exceeding this limit are explicit in the architecture test to avoid any modification of business logic.
 

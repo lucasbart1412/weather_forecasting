@@ -22,7 +22,6 @@ Weather Forecast is a local weather forecasting application based on machine lea
 - [Installation](#installation)
 - [Data and models](#data-and-models)
 - [Usage](#utilisation)
-- [Exploratory analysis](#exploratory-analysis)
 - [Tests and quality](#tests-and-quality)
 - [Images](#images)
 - [Troubleshooting](#troubleshooting)
@@ -67,6 +66,9 @@ Weather Forecast combines:
 - Hourly lags.
 - Chronological imputation without leakage from the future to the past.
 - Precipitation quantity targets use `log1p` during training and `expm1` for predictions and evaluation; rain probability and input features stay in physical units.
+- A regularized Ridge bias corrector uses a small set of physical and cyclic-time features and is retained only when it improves the primary validation error.
+- Chronological calibration separates corrector fitting, precipitation-threshold tuning, and holdout evaluation.
+- Training reports MAE, RMSE, and Pearson correlation separately, and estimates remaining time from observed task durations.
 - Safety bounds for humidity, pressure, temperature, rain, wind, and clouds.
 - Fallback to the current observation when a model is missing or has failed.
 - RAM cleanup via `gc` and `malloc_trim` when the platform allows it.
@@ -96,11 +98,6 @@ graph LR
 ```text
 weather_app/
 |-- app.py                         # Streamlit dashboard entry point
-|-- config.py                      # Historical compatibility facade
-|-- inference.py                   # Compatibility facade for batch inference
-|-- models.py                      # Facade for serialized model classes
-|-- train.py                       # Legacy training entry point
-|-- eval_model.py                  # Evaluation entry point
 |-- utils_features.py              # Utility facade for feature services
 |-- plot_correlations.py           # Analysis helper entry point
 |-- infrastructure/                # Configuration, logging, geolocation
@@ -171,9 +168,9 @@ and per time block according to the project's configuration.
 
 ### Integration in Python code
 ```python
-from training.pipeline import main
+from ml.batch_predictor import BatchWeatherPredictor
 
-main()
+predictor = BatchWeatherPredictor("./binary")
 ```
 
 ### Environment and local execution
@@ -192,7 +189,8 @@ python3 plot_correlations.py
 ```
 
 The evaluation paths are configurable and default to the directory defined by
-`WeatherConfig.BASE_DIR`. The scripts can also be used from a notebook or a CI job.
+`WeatherConfig.BASE_DIR`. The package modules can also be imported from a
+notebook or a CI job.
 
 ## Exploratory analysis
 
@@ -214,9 +212,6 @@ amounts in their original units. Rain probability classification and predictor
 features remain unchanged. See
 [`feature_engineering/target_transforms.py`](feature_engineering/target_transforms.py).
 
-In the feature engineering code, we only apply logarithms to rainfall, which is very often skewed. 
-If you think another feature should be logarithmised, feel free to do so, but don’t forget to apply the inverse operation in the forecasts: `np.expm1()`.
-
 ## Tests and quality
 
 Run the full suite:
@@ -230,7 +225,8 @@ CI is executed on GitHub Actions for each push and pull request. The workflow ru
 
 The tests cover atmospheric physics, solar calculations, data
 preparation, Open-Meteo parsing, inference fallbacks, physical
-bounds, compatibility facades, and package architecture.
+bounds, model components, package architecture, and removal of obsolete
+root-level entry points.
 The HTTP network is replaced by mocked sessions and no large
 model is required.
 

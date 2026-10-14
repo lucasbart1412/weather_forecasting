@@ -2,12 +2,12 @@
 from pathlib import Path
 
 from joblib import load as job_load
-from numpy import array, cos, greater, less, pi, sin
-from pandas import DataFrame, Series, Timedelta, to_datetime
+from numpy import array, asarray, cos, greater, less, pi, sin
+from pandas import DataFrame, Series, Timedelta, isna, to_datetime
 
 from feature_engineering.feature_engineering import FeatureEngineer
 from feature_engineering.target_transforms import decode_model_target
-from infrastructure.config import WeatherConfig
+from infrastructure.config import WeatherConfig, logger
 from ml.bias_correction import apply_bias_correction
 
 
@@ -38,6 +38,58 @@ class WeatherPredictor:
     def _get_precip_threshold(bundle, fallback):
         return float(bundle.get("optimal_threshold", fallback))
 
+    def _feature_names_for(self, bundle, estimator):
+        """Return the model's ordered feature schema without stacking metadata."""
+        model_features = getattr(estimator, "feature_name_", None)
+        if model_features is None or len(model_features) == 0:
+            model_features = getattr(estimator, "feature_names_in_", None)
+        if model_features is not None and len(model_features) > 0:
+            return [name for name in model_features if name != "time_step"]
+        return [
+            name
+            for name in bundle.get("features", self.meta["features"])
+            if name != "time_step"
+        ]
+
+    @staticmethod
+    def _is_neutral_synoptic_delta(feature):
+        return feature.endswith("_delta") and any(
+            scale in feature for scale in ("_syn_", "_macro_", "_hemi_")
+        )
+
+    def _select_model_features(self, df, bundle, estimator, target, block):
+        """Align inference data to a bundle and fill only absent synoptic deltas."""
+        model_features = self._feature_names_for(bundle, estimator)
+        missing_features = [name for name in model_features if name not in df.columns]
+        neutral_deltas = [
+            name
+            for name in missing_features
+            if self._is_neutral_synoptic_delta(name)
+        ]
+        if neutral_deltas:
+            warning_key = tuple(neutral_deltas)
+            warned_schemas = getattr(self, "_warned_neutral_delta_schemas", set())
+            if warning_key not in warned_schemas:
+                logger.warning(
+                    "Missing synoptic delta features for %s/%s; using neutral zero: %s",
+                    target,
+                    block,
+                    neutral_deltas,
+                )
+                self._warned_neutral_delta_schemas = warned_schemas | {warning_key}
+            df = df.copy()
+            for name in neutral_deltas:
+                df[name] = 0.0
+
+        remaining_missing = [
+            name for name in model_features if name not in df.columns
+        ]
+        if remaining_missing:
+            raise ValueError(
+                f"Missing features for {target}/{block}: {remaining_missing}"
+            )
+        return df.loc[:, model_features].astype("float32")
+
     def get_tide_extremes(self, predictions):
         """Detects peaks (Highs) and troughs (Lows) in the prediction series."""
         from scipy.signal import argrelextrema
@@ -60,11 +112,26 @@ class WeatherPredictor:
     def predict(
         self, target_hours: float, df_live: DataFrame, obs: dict, geo: dict
     ) -> dict:
-        # X_dict contains the CURRENT state of the atmosphere (T0) and its recent history, as well as the temporal information of the targeted future (T+H)
         last_row = df_live.iloc[-1]
+        block = self._get_block_for_horizon(target_hours)
 
-        # We prepare the dictionary with the current data
-        X_dict = {f: last_row.get(f, 0) for f in self.meta["features"]}
+        model_features = set(self.meta["features"])
+        for bundles in self.models.values():
+            bundle = bundles.get(block)
+            if bundle is not None:
+                model_features.update(
+                    self._feature_names_for(bundle, bundle["model"])
+                )
+
+        X_dict = {}
+        for feature in model_features:
+            value = last_row.get(feature, 0)
+            if (
+                self._is_neutral_synoptic_delta(feature)
+                and (feature not in last_row.index or isna(value))
+            ):
+                continue
+            X_dict[feature] = value
 
         target_dt = obs["time"] + Timedelta(hours=target_hours)
 
@@ -78,10 +145,8 @@ class WeatherPredictor:
         X_dict["target_month_sin"] = sin(2 * pi * target_dt.month / 12)
         X_dict["target_month_cos"] = cos(2 * pi * target_dt.month / 12)
 
-        # Creating the DataFrame by forcing the exact order of the meta features
-        X = DataFrame([X_dict])[self.meta["features"]].astype("float32")
+        X = DataFrame([X_dict]).astype("float32")
 
-        block = self._get_block_for_horizon(target_hours)
         res = {}
 
         for t in WeatherConfig.TARGETS:
@@ -89,21 +154,26 @@ class WeatherPredictor:
                 res[t] = obs.get(t, 0)
                 continue
             bundle = self.models[t][block]
-            model_features = bundle.get("features", self.meta["features"])
             X["time_step"] = (
                 target_hours  # Added the feature time_step for stacking
             )
-            # We only keep the columns that the model knows
-            X_model = X[model_features].copy()
-            if "time_step" in X_model.columns:
-                X_model = X_model.drop(columns=["time_step"])
+            X_model = self._select_model_features(
+                X, bundle, bundle["model"], t, block
+            )
             if t == "precip":
                 # 1. Load and predict probability
                 prob_path = Path(self.base_path) / f"model_precip_prob_{block}.pkl"
                 if prob_path.exists():
                     prob_model = job_load(prob_path)
                     # predict_proba returns [P(no), P(yes)]
-                    res["precip_prob"] = prob_model.predict_proba(X_model)[0][1] * 100
+                    X_prob = self._select_model_features(
+                        X,
+                        {"features": self.meta["features"]},
+                        prob_model,
+                        "precip_prob",
+                        block,
+                    )
+                    res["precip_prob"] = prob_model.predict_proba(X_prob)[0][1] * 100
 
                 threshold = self._get_precip_threshold(bundle, 0.05) * 100
                 # 2. Predict quantity only above the validation-optimized threshold.
@@ -120,31 +190,30 @@ class WeatherPredictor:
                     continue
 
             # Inference with the right columns
-            raw_pred = bundle["model"].predict(X_model)[0]
+            raw_pred = float(bundle["model"].predict(X_model)[0])
             if t == "cloud":
                 # Security to avoid slight digital overflows from the Stacking (e.g.: 100.1% or -0.2%)
                 raw_pred = max(0.0, min(100.0, raw_pred))
-            # INITIALIZATION BEFORE CORRECTION
-            prediction_finale = raw_pred
-
-            # Applying time bias correction
+            # Corrector returns the prediction plus its learned residual estimate.
             m_h = target_dt.month
             t_h = target_dt.hour
-            try:
-                bias = apply_bias_correction(
-                    bias_model=bundle["bias_corrector"],
-                    df_inference=X_model,
+            bias_corrector = bundle.get("bias_corrector")
+            if bias_corrector is not None:
+                corrected_prediction = apply_bias_correction(
+                    bias_model=bias_corrector,
+                    df_inference=X,
                     target=t,
                     df_predictions=Series([raw_pred]),
                 )
-            except Exception:
-                bias = 0.0
-            prediction_finale = raw_pred + bias
-            prediction_finale = decode_model_target(
+                prediction_finale = float(corrected_prediction.iloc[0])
+            else:
+                prediction_finale = raw_pred
+            decoded_prediction = decode_model_target(
                 t,
                 [prediction_finale],
                 bundle.get("target_transform"),
-            )[0]
+            )
+            prediction_finale = float(asarray(decoded_prediction).reshape(-1)[0])
 
             if t in ["temp", "press", "hum"]:
                 norm = self.meta["clima"].get(t, {}).get((m_h, t_h), obs.get(t, 0))
@@ -172,5 +241,3 @@ class WeatherPredictor:
         target_dt = to_datetime(obs["time"]) + Timedelta(hours=int(target_hours))
         res["time"] = target_dt
         return res
-
-

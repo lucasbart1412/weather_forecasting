@@ -1,7 +1,4 @@
-"""
-eval_model.py
-Weather forecast model evaluation script (WeatherMaster).
-"""
+"""Weather forecast model evaluation implementation."""
 from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np

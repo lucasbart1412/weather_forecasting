@@ -1,6 +1,6 @@
 """
 ================================================================================
-models.py - Deserialization Classes for Production Inference
+ml/models_impl.py - Serializable classes for production inference
 ================================================================================
 This module contains ONLY the class skeletons required by joblib
 to deserialize the driven .pkl models.
@@ -52,7 +52,7 @@ try:
 except (ImportError, OSError, Exception):
     HAS_CATBOOST = False
 
-# Importing the logger from config
+# Importing the logger from the infrastructure configuration module
 try:
     from infrastructure.config import logger
 except ImportError:
@@ -176,4 +176,3 @@ class StackingMixin:
 
 class TimeSeriesStackingRegressor(StackingMixin, BaseEstimator, RegressorMixin):
     """Historical compatibility: the real logic is in the mixin."""
-
